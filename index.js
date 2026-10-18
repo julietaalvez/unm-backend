@@ -139,18 +139,24 @@ app.get('/clases/hoy', (req, res) => {
       console.log('Error en /clases/hoy:', err);
       return res.status(500).json({ error: 'Error del servidor.' });
     }
-    const vistas = new Set();
-    const out = [];
+    // Una fila por clase: si tiene varios docentes, se juntan en el mismo texto
+    const porClase = new Map();
     for (const r of rows) {
       if (diaJS(r.dia_semana) !== hoy) continue;
-      const clave = `${r.id}-${r.profesor_id}`;
-      if (vistas.has(clave)) continue;
-      vistas.add(clave);
-      out.push({
-        aula_id: r.codigo_mapa, materia: r.materia,
-        desde: hhmm(r.desde), hasta: hhmm(r.hasta), profesor: nombreProfe(r),
-      });
+      const clave = `${r.id}`;
+      const nombre = nombreProfe(r);
+      if (!porClase.has(clave)) {
+        porClase.set(clave, {
+          aula_id: r.codigo_mapa, materia: r.materia,
+          desde: hhmm(r.desde), hasta: hhmm(r.hasta), profes: [],
+        });
+      }
+      const c = porClase.get(clave);
+      if (nombre && !c.profes.includes(nombre)) c.profes.push(nombre);
     }
+    const out = [...porClase.values()]
+      .map(({ profes, ...c }) => ({ ...c, profesor: profes.join(', ') }))
+      .sort((a, b) => a.desde.localeCompare(b.desde));
     res.json(out);
   });
 });
