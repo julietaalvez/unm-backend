@@ -132,7 +132,8 @@ function ahoraAR() {
 
 // GET /clases/hoy -> [{ aula_id, materia, desde, hasta, profesor }]
 app.get('/clases/hoy', (req, res) => {
-  const hoy = ahoraAR();
+  // ?dia=1 (lunes) … 0 (domingo): solo para probar otro día
+  const hoy = req.query.dia !== undefined ? Number(req.query.dia) : ahoraAR();
   dbAcad.query(SQL_HORARIOS + ' WHERE h.presencial = 1 AND e.codigo_mapa IS NOT NULL', (err, rows) => {
     if (err) {
       console.log('Error en /clases/hoy:', err);
