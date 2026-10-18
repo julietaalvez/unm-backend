@@ -222,7 +222,47 @@ app.get('/aulas', (req, res) => {
     })));
   });
 });
+/*Inscripciones: las materias que cursa cada usuario*/
+const idValido = (v) => Number.isInteger(Number(v)) && Number(v) > 0;
+const claveValida = (c) => typeof c === 'string' && c.length > 0 && c.length <= 255;
 
+// GET /usuarios/:id/inscripciones -> { claves: ["Materia|comisión", ...] }
+app.get('/usuarios/:id/inscripciones', (req, res) => {
+  if (!idValido(req.params.id)) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query('SELECT clave FROM inscripciones WHERE usuario_id = ? ORDER BY id', [req.params.id], (err, rows) => {
+    if (err) {
+      console.log('Error al leer inscripciones:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json({ claves: rows.map((r) => r.clave) });
+  });
+});
+
+// POST /usuarios/:id/inscripciones  { clave }
+app.post('/usuarios/:id/inscripciones', (req, res) => {
+  const { clave } = req.body;
+  if (!idValido(req.params.id) || !claveValida(clave)) return res.status(400).json({ error: 'Datos inválidos.' });
+  db.query('INSERT IGNORE INTO inscripciones (usuario_id, clave) VALUES (?, ?)', [req.params.id, clave], (err) => {
+    if (err) {
+      console.log('Error al inscribir:', err);
+      return res.status(500).json({ error: 'No se pudo guardar.' });
+    }
+    res.json({ ok: true });
+  });
+});
+
+// DELETE /usuarios/:id/inscripciones?clave=...
+app.delete('/usuarios/:id/inscripciones', (req, res) => {
+  const clave = req.query.clave;
+  if (!idValido(req.params.id) || !claveValida(clave)) return res.status(400).json({ error: 'Datos inválidos.' });
+  db.query('DELETE FROM inscripciones WHERE usuario_id = ? AND clave = ?', [req.params.id, clave], (err) => {
+    if (err) {
+      console.log('Error al quitar inscripción:', err);
+      return res.status(500).json({ error: 'No se pudo quitar.' });
+    }
+    res.json({ ok: true });
+  });
+});
 app.listen(process.env.PORT || 3000, () =>
   console.log('Servidor corriendo en el puerto', process.env.PORT || 3000)
 );
