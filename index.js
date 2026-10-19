@@ -103,7 +103,7 @@ app.post('/login', (req, res) => {
 // Una fila por cada horario, con todo lo necesario ya unido.
 const SQL_HORARIOS = `
   SELECT h.id, h.dia_semana, h.desde, h.hasta, h.presencial, h.alterna, h.aula_texto,
-         m.nombre AS materia, m.anio,
+         m.nombre AS materia, m.anio, m.cuatrimestre,
          c.codigo AS comision, c.modalidad,
          e.codigo_mapa, e.nombre AS espacio, e.piso, e.edificio_id,
          ed.nombre AS edificio,
@@ -188,6 +188,7 @@ app.get('/profesores', (req, res) => {
           aula: r.codigo_mapa || null, lugar, extra: [],
           materia: r.materia, comision: r.comision || '', anio: r.anio || 0,
           modo: presencial ? 'presencial' : 'virtual', alterna: r.alterna === 1 || r.alterna === true,
+          cuatrimestre: r.cuatrimestre != null ? Number(r.cuatrimestre) : 0,
         });
       }
       const f = p.franjas.get(fk);
