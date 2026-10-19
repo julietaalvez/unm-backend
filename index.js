@@ -44,7 +44,7 @@ app.get('/novedades', (req, res) => {
 });
 
 app.post('/register', (req, res) => {
-  const { nombre, email, contrasena } = req.body;
+  const { nombre, email, contrasena, carreras } = req.body;
 
   if (!nombre || !email || !contrasena) {
     return res.status(400).json({ error: 'Faltan datos.' });
@@ -59,15 +59,18 @@ app.post('/register', (req, res) => {
       return res.status(409).json({ error: 'Ese email ya está registrado.' });
     }
 
-    db.query(
+       db.query(
       'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
       [nombre, email, contrasena, 'estudiante'],
-      (err2) => {
+      (err2, result) => {
         if (err2) {
           console.log('Error al registrar:', err2);
           return res.status(500).json({ error: 'No se pudo registrar.' });
         }
-        res.json({ ok: true });
+        guardarCarreras(result.insertId, carreras, (err3) => {
+          if (err3) console.log('Error al guardar carreras:', err3);
+          res.json({ ok: true });
+        });
       }
     );
   });
@@ -262,6 +265,82 @@ app.delete('/usuarios/:id/inscripciones', (req, res) => {
       return res.status(500).json({ error: 'No se pudo quitar.' });
     }
     res.json({ ok: true });
+  });
+});
+/* ============================================================
+   Carreras
+   ============================================================ */
+
+// Guarda las carreras de un usuario (reemplaza las anteriores)
+function guardarCarreras(usuarioId, ids, cb) {
+  const limpias = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  db.query('DELETE FROM usuario_carreras WHERE usuario_id = ?', [usuarioId], (err) => {
+    if (err) return cb(err);
+    if (limpias.length === 0) return cb(null);
+    db.query(
+      'INSERT IGNORE INTO usuario_carreras (usuario_id, carrera_id) SELECT ?, id FROM carreras WHERE id IN (?)',
+      [usuarioId, limpias],
+      cb
+    );
+  });
+}
+
+// GET /carreras -> [{ id, nombre }]
+app.get('/carreras', (req, res) => {
+  db.query('SELECT id, nombre FROM carreras ORDER BY nombre', (err, rows) => {
+    if (err) {
+      console.log('Error en /carreras:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json(rows);
+  });
+});
+
+// GET /usuarios/:id/carreras -> { ids: [1, 2] }
+app.get('/usuarios/:id/carreras', (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query('SELECT carrera_id FROM usuario_carreras WHERE usuario_id = ?', [uid], (err, rows) => {
+    if (err) {
+      console.log('Error al leer carreras:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json({ ids: rows.map((r) => r.carrera_id) });
+  });
+});
+
+// PUT /usuarios/:id/carreras  { carreras: [1, 2] }
+app.put('/usuarios/:id/carreras', (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'Usuario inválido.' });
+  guardarCarreras(uid, req.body.carreras, (err) => {
+    if (err) {
+      console.log('Error al guardar carreras:', err);
+      return res.status(500).json({ error: 'No se pudo guardar.' });
+    }
+    res.json({ ok: true });
+  });
+});
+
+// GET /materias/carreras -> [{ materia, carrera_id }]  (qué materia es de qué carrera)
+app.get('/materias/carreras', (req, res) => {
+  db.query('SELECT materia, carrera_id FROM materia_carreras', (err, rows) => {
+    if (err) {
+      console.log('Error en /materias/carreras:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json(rows);
+  });
+});
+
+// GET /materias -> [{ nombre, anio }]  (lista de materias tal cual están en la base, para asignarlas a carreras)
+app.get('/materias', (req, res) => {
+  dbAcad.query('SELECT DISTINCT nombre, anio FROM materias ORDER BY anio, nombre', (err, rows) => {
+    if (err) {
+      console.log('Error en /materias:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json(rows);
   });
 });
 app.listen(process.env.PORT || 3000, () =>
