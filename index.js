@@ -4,7 +4,7 @@ require('dotenv').config();
 
 const app = express();
 app.use(require('cors')());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 // Base 1: la de siempre (usuarios, login, registro)
 const db = mysql.createPool(process.env.MYSQL_PUBLIC_URL);
@@ -267,9 +267,7 @@ app.delete('/usuarios/:id/inscripciones', (req, res) => {
     res.json({ ok: true });
   });
 });
-/* ============================================================
-   Carreras
-   ============================================================ */
+/*Carreras*/
 
 // Guarda las carreras de un usuario (reemplaza las anteriores)
 function guardarCarreras(usuarioId, ids, cb) {
@@ -341,6 +339,41 @@ app.get('/materias', (req, res) => {
       return res.status(500).json({ error: 'Error del servidor.' });
     }
     res.json(rows);
+  });
+});
+// PUT /usuarios/:id  { nombre?, foto? }  (foto = "data:image/jpeg;base64,..." o null para quitarla)
+app.put('/usuarios/:id', (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'Usuario inválido.' });
+
+  const { nombre, foto } = req.body;
+  const campos = [];
+  const valores = [];
+
+  if (nombre !== undefined) {
+    const n = String(nombre).trim();
+    if (n.length < 2 || n.length > 100) return res.status(400).json({ error: 'El nombre no es válido.' });
+    campos.push('nombre = ?');
+    valores.push(n);
+  }
+  if (foto !== undefined) {
+    if (foto !== null && (typeof foto !== 'string' || !foto.startsWith('data:image/') || foto.length > 1500000)) {
+      return res.status(400).json({ error: 'La foto no es válida.' });
+    }
+    campos.push('foto = ?');
+    valores.push(foto);
+  }
+  if (campos.length === 0) return res.status(400).json({ error: 'No hay nada para actualizar.' });
+
+  db.query(`UPDATE usuarios SET ${campos.join(', ')} WHERE id = ?`, [...valores, uid], (err) => {
+    if (err) {
+      console.log('Error al actualizar usuario:', err);
+      return res.status(500).json({ error: 'No se pudo guardar.' });
+    }
+    db.query('SELECT id, nombre, email, rol, foto FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
+      if (err2 || rows.length === 0) return res.status(500).json({ error: 'Error del servidor.' });
+      res.json({ usuario: rows[0] });
+    });
   });
 });
 app.listen(process.env.PORT || 3000, () =>
