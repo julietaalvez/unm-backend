@@ -341,10 +341,66 @@ app.get('/materias', (req, res) => {
     res.json(rows);
   });
 });
-// PUT /usuarios/:id  { nombre?, foto? }  (foto = "data:image/jpeg;base64,..." o null para quitarla)
+// PUT /usuarios/:id  { nombre?, email?, foto? }  (foto = "data:image/jpeg;base64,..." o null para quitarla)
 app.put('/usuarios/:id', (req, res) => {
   const uid = Number(req.params.id);
   if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'Usuario inválido.' });
+
+  const { nombre, email, foto } = req.body;
+  const campos = [];
+  const valores = [];
+
+  if (nombre !== undefined) {
+    const n = String(nombre).trim();
+    if (n.length < 2 || n.length > 100) return res.status(400).json({ error: 'El nombre no es válido.' });
+    campos.push('nombre = ?');
+    valores.push(n);
+  }
+
+  let emailNuevo = null;
+  if (email !== undefined) {
+    emailNuevo = String(email).trim().toLowerCase();
+    if (emailNuevo.length > 150 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNuevo)) {
+      return res.status(400).json({ error: 'El email no es válido.' });
+    }
+    campos.push('email = ?');
+    valores.push(emailNuevo);
+  }
+
+  if (foto !== undefined) {
+    if (foto !== null && (typeof foto !== 'string' || !foto.startsWith('data:image/') || foto.length > 1500000)) {
+      return res.status(400).json({ error: 'La foto no es válida.' });
+    }
+    campos.push('foto = ?');
+    valores.push(foto);
+  }
+
+  if (campos.length === 0) return res.status(400).json({ error: 'No hay nada para actualizar.' });
+
+  const actualizar = () =>
+    db.query(`UPDATE usuarios SET ${campos.join(', ')} WHERE id = ?`, [...valores, uid], (err) => {
+      if (err) {
+        console.log('Error al actualizar usuario:', err);
+        return res.status(500).json({ error: 'No se pudo guardar.' });
+      }
+      db.query('SELECT id, nombre, email, rol, foto FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
+        if (err2 || rows.length === 0) return res.status(500).json({ error: 'Error del servidor.' });
+        res.json({ usuario: rows[0] });
+      });
+    });
+
+  if (!emailNuevo) return actualizar();
+
+  // el email no puede estar usado por otra cuenta
+  db.query('SELECT id FROM usuarios WHERE email = ? AND id <> ?', [emailNuevo, uid], (err, rows) => {
+    if (err) {
+      console.log('Error al verificar email:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    if (rows.length > 0) return res.status(409).json({ error: 'Ese email ya está registrado.' });
+    actualizar();
+  });
+});
 
   const { nombre, foto } = req.body;
   const campos = [];
@@ -375,7 +431,6 @@ app.put('/usuarios/:id', (req, res) => {
       res.json({ usuario: rows[0] });
     });
   });
-});
 app.listen(process.env.PORT || 3000, () =>
   console.log('Servidor corriendo en el puerto', process.env.PORT || 3000)
 );
