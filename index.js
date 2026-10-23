@@ -43,6 +43,28 @@ app.get('/novedades', (req, res) => {
   });
 });
 
+/* ============================================================
+   Carreras (la función se usa también al registrarse)
+   ============================================================ */
+
+// Guarda las carreras de un usuario (reemplaza las anteriores)
+function guardarCarreras(usuarioId, ids, cb) {
+  const limpias = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  db.query('DELETE FROM usuario_carreras WHERE usuario_id = ?', [usuarioId], (err) => {
+    if (err) return cb(err);
+    if (limpias.length === 0) return cb(null);
+    db.query(
+      'INSERT IGNORE INTO usuario_carreras (usuario_id, carrera_id) SELECT ?, id FROM carreras WHERE id IN (?)',
+      [usuarioId, limpias],
+      cb
+    );
+  });
+}
+
+/* ============================================================
+   Registro y login
+   ============================================================ */
+
 app.post('/register', (req, res) => {
   const { nombre, email, contrasena, carreras } = req.body;
 
@@ -59,7 +81,7 @@ app.post('/register', (req, res) => {
       return res.status(409).json({ error: 'Ese email ya está registrado.' });
     }
 
-       db.query(
+    db.query(
       'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
       [nombre, email, contrasena, 'estudiante'],
       (err2, result) => {
@@ -226,7 +248,22 @@ app.get('/aulas', (req, res) => {
     })));
   });
 });
-/*Inscripciones: las materias que cursa cada usuario*/
+
+// GET /materias -> [{ nombre, anio }]  (lista de materias tal cual están en la base, para asignarlas a carreras)
+app.get('/materias', (req, res) => {
+  dbAcad.query('SELECT DISTINCT nombre, anio FROM materias ORDER BY anio, nombre', (err, rows) => {
+    if (err) {
+      console.log('Error en /materias:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    res.json(rows);
+  });
+});
+
+/* ============================================================
+   Inscripciones: las materias que cursa cada usuario
+   ============================================================ */
+
 const idValido = (v) => Number.isInteger(Number(v)) && Number(v) > 0;
 const claveValida = (c) => typeof c === 'string' && c.length > 0 && c.length <= 255;
 
@@ -267,21 +304,10 @@ app.delete('/usuarios/:id/inscripciones', (req, res) => {
     res.json({ ok: true });
   });
 });
-/*Carreras*/
 
-// Guarda las carreras de un usuario (reemplaza las anteriores)
-function guardarCarreras(usuarioId, ids, cb) {
-  const limpias = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  db.query('DELETE FROM usuario_carreras WHERE usuario_id = ?', [usuarioId], (err) => {
-    if (err) return cb(err);
-    if (limpias.length === 0) return cb(null);
-    db.query(
-      'INSERT IGNORE INTO usuario_carreras (usuario_id, carrera_id) SELECT ?, id FROM carreras WHERE id IN (?)',
-      [usuarioId, limpias],
-      cb
-    );
-  });
-}
+/* ============================================================
+   Carreras
+   ============================================================ */
 
 // GET /carreras -> [{ id, nombre }]
 app.get('/carreras', (req, res) => {
@@ -331,16 +357,10 @@ app.get('/materias/carreras', (req, res) => {
   });
 });
 
-// GET /materias -> [{ nombre, anio }]  (lista de materias tal cual están en la base, para asignarlas a carreras)
-app.get('/materias', (req, res) => {
-  dbAcad.query('SELECT DISTINCT nombre, anio FROM materias ORDER BY anio, nombre', (err, rows) => {
-    if (err) {
-      console.log('Error en /materias:', err);
-      return res.status(500).json({ error: 'Error del servidor.' });
-    }
-    res.json(rows);
-  });
-});
+/* ============================================================
+   Perfil: nombre, email y foto
+   ============================================================ */
+
 // PUT /usuarios/:id  { nombre?, email?, foto? }  (foto = "data:image/jpeg;base64,..." o null para quitarla)
 app.put('/usuarios/:id', (req, res) => {
   const uid = Number(req.params.id);
@@ -402,35 +422,85 @@ app.put('/usuarios/:id', (req, res) => {
   });
 });
 
-  const { nombre, foto } = req.body;
-  const campos = [];
-  const valores = [];
+/* ============================================================
+   Novedades y notificaciones
+   ============================================================ */
 
-  if (nombre !== undefined) {
-    const n = String(nombre).trim();
-    if (n.length < 2 || n.length > 100) return res.status(400).json({ error: 'El nombre no es válido.' });
-    campos.push('nombre = ?');
-    valores.push(n);
-  }
-  if (foto !== undefined) {
-    if (foto !== null && (typeof foto !== 'string' || !foto.startsWith('data:image/') || foto.length > 1500000)) {
-      return res.status(400).json({ error: 'La foto no es válida.' });
+const uidValido = (v) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
+// GET /usuarios/:id/novedades -> las que le corresponden a este usuario, con { leida }
+app.get('/usuarios/:id/novedades', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query(
+    `SELECT n.id, n.titulo, n.texto, n.tipo, n.materia, n.fecha,
+            (l.novedad_id IS NOT NULL) AS leida
+     FROM novedades n
+     LEFT JOIN novedades_leidas l ON l.novedad_id = n.id AND l.usuario_id = ?
+     WHERE n.materia IS NULL
+        OR n.materia IN (SELECT DISTINCT SUBSTRING_INDEX(clave, '|', 1) FROM inscripciones WHERE usuario_id = ?)
+     ORDER BY n.fecha DESC, n.id DESC
+     LIMIT 50`,
+    [uid, uid],
+    (err, rows) => {
+      if (err) {
+        console.log('Error en novedades del usuario:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      res.json(rows.map((r) => ({ ...r, leida: !!r.leida })));
     }
-    campos.push('foto = ?');
-    valores.push(foto);
-  }
-  if (campos.length === 0) return res.status(400).json({ error: 'No hay nada para actualizar.' });
+  );
+});
 
-  db.query(`UPDATE usuarios SET ${campos.join(', ')} WHERE id = ?`, [...valores, uid], (err) => {
+// POST /usuarios/:id/novedades/leer  { ids: [1, 2] }
+app.post('/usuarios/:id/novedades/leer', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  const ids = [...new Set((Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (ids.length === 0) return res.json({ ok: true });
+  db.query(
+    'INSERT IGNORE INTO novedades_leidas (usuario_id, novedad_id) SELECT ?, id FROM novedades WHERE id IN (?)',
+    [uid, ids],
+    (err) => {
+      if (err) {
+        console.log('Error al marcar leídas:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      res.json({ ok: true });
+    }
+  );
+});
+
+// GET /usuarios/:id/notificaciones -> { push: true|false }
+app.get('/usuarios/:id/notificaciones', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query('SELECT notif_push FROM usuarios WHERE id = ?', [uid], (err, rows) => {
     if (err) {
-      console.log('Error al actualizar usuario:', err);
+      console.log('Error al leer preferencia:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    if (rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado.' });
+    res.json({ push: rows[0].notif_push === 1 });
+  });
+});
+
+// PUT /usuarios/:id/notificaciones  { push: true|false }
+app.put('/usuarios/:id/notificaciones', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query('UPDATE usuarios SET notif_push = ? WHERE id = ?', [req.body.push ? 1 : 0, uid], (err) => {
+    if (err) {
+      console.log('Error al guardar preferencia:', err);
       return res.status(500).json({ error: 'No se pudo guardar.' });
     }
-    db.query('SELECT id, nombre, email, rol, foto FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
-      if (err2 || rows.length === 0) return res.status(500).json({ error: 'Error del servidor.' });
-      res.json({ usuario: rows[0] });
-    });
+    res.json({ ok: true });
   });
+});
+
 app.listen(process.env.PORT || 3000, () =>
   console.log('Servidor corriendo en el puerto', process.env.PORT || 3000)
 );
