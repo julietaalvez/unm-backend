@@ -3,6 +3,8 @@ const mysql = require('mysql2');
 require('dotenv').config();
 
 const app = express();
+// Railway pasa las conexiones por un proxy: sin esto el límite de intentos no distingue usuarios
+app.set('trust proxy', 1);
 app.use(require('cors')());
 app.use(express.json({ limit: '2mb' }));
 
@@ -62,14 +64,105 @@ function guardarCarreras(usuarioId, ids, cb) {
 }
 
 /* ============================================================
+   Validación de docentes
+   ============================================================ */
+
+const MSG_DOCENTE =
+  'No pudimos validar tu cuenta de docente. Revisá tu nombre y apellido o contactá a la secretaría.';
+
+// sin tildes, sin mayúsculas, sin importar el orden de las palabras
+const norm = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const tokensDe = (t) => norm(t).split(/[^a-z0-9]+/).filter(Boolean);
+const contiene = (grande, chico) => chico.length > 0 && chico.every((x) => grande.includes(x));
+const nombreCompleto = (p) => [p.nombre, p.apellido].filter(Boolean).join(' ');
+
+// límite de intentos fallidos: 5 errores y se bloquea 10 minutos
+const intentos = new Map();
+const MAX_INTENTOS = 5;
+const BLOQUEO_MS = 10 * 60 * 1000;
+function bloqueado(ip) {
+  const r = intentos.get(ip);
+  if (!r || !r.hasta) return false;
+  if (r.hasta > Date.now()) return true;
+  intentos.delete(ip);
+  return false;
+}
+function falloIntento(ip) {
+  const r = intentos.get(ip) || { n: 0, hasta: 0 };
+  r.n += 1;
+  if (r.n >= MAX_INTENTOS) {
+    r.hasta = Date.now() + BLOQUEO_MS;
+    r.n = 0;
+  }
+  intentos.set(ip, r);
+}
+
+// Busca al docente en la base académica. Si hay homónimos, desempata por carrera.
+async function buscarDocente(nombre, carreras) {
+  const buscados = tokensDe(nombre);
+  if (buscados.length < 2) return null; // hace falta nombre y apellido
+
+  const [profes] = await dbAcad.promise().query('SELECT id, nombre, apellido FROM profesores');
+  let candidatos = profes.filter((p) => contiene(tokensDe(nombreCompleto(p)), buscados));
+  if (candidatos.length <= 1) return candidatos[0] || null;
+
+  const ids = [...new Set((Array.isArray(carreras) ? carreras : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (ids.length === 0) return null;
+
+  const [mc] = await db.promise().query('SELECT DISTINCT materia FROM materia_carreras WHERE carrera_id IN (?)', [ids]);
+  const materiasDeLaCarrera = new Set(mc.map((r) => norm(r.materia)));
+
+  const [dicta] = await dbAcad.promise().query(
+    `SELECT cd.profesor_id, m.nombre AS materia
+     FROM comision_docentes cd
+     JOIN comisiones c ON c.id = cd.comision_id
+     JOIN materias m ON m.id = c.materia_id
+     WHERE cd.profesor_id IN (?)`,
+    [candidatos.map((p) => p.id)]
+  );
+  const enCarrera = new Set(dicta.filter((r) => materiasDeLaCarrera.has(norm(r.materia))).map((r) => r.profesor_id));
+  candidatos = candidatos.filter((p) => enCarrera.has(p.id));
+  return candidatos.length === 1 ? candidatos[0] : null;
+}
+
+// Si ya hay una cuenta de profesor con ese nombre, no se crea otra
+async function docenteYaRegistrado(docente) {
+  const completo = tokensDe(nombreCompleto(docente));
+  const [ya] = await db.promise().query("SELECT nombre FROM usuarios WHERE rol = 'profesor'");
+  return ya.some((u) => {
+    const t = tokensDe(u.nombre);
+    return contiene(completo, t) || contiene(t, completo);
+  });
+}
+
+/* ============================================================
    Registro y login
    ============================================================ */
 
-app.post('/register', (req, res) => {
-  const { nombre, email, contrasena, carreras } = req.body;
+app.post('/register', async (req, res) => {
+  const { nombre, email, contrasena, carreras, rol } = req.body;
 
   if (!nombre || !email || !contrasena) {
     return res.status(400).json({ error: 'Faltan datos.' });
+  }
+
+  const esProfesor = rol === 'profesor';
+
+  if (esProfesor) {
+    if (bloqueado(req.ip)) {
+      return res.status(429).json({ error: 'Demasiados intentos. Probá de nuevo en unos minutos.' });
+    }
+    try {
+      const docente = await buscarDocente(nombre, carreras);
+      const valido = !!docente && !(await docenteYaRegistrado(docente));
+      if (!valido) {
+        falloIntento(req.ip);
+        return res.status(403).json({ error: MSG_DOCENTE });
+      }
+    } catch (e) {
+      console.log('Error al validar docente:', e);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
   }
 
   db.query('SELECT id FROM usuarios WHERE email = ?', [email], (err, results) => {
@@ -83,7 +176,7 @@ app.post('/register', (req, res) => {
 
     db.query(
       'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
-      [nombre, email, contrasena, 'estudiante'],
+      [nombre, email, contrasena, esProfesor ? 'profesor' : 'estudiante'],
       (err2, result) => {
         if (err2) {
           console.log('Error al registrar:', err2);
