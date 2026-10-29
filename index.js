@@ -1,5 +1,7 @@
 const express = require('express');
 const mysql = require('mysql2');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -140,8 +142,7 @@ async function docenteYaRegistrado(docente) {
    ============================================================ */
 
 app.post('/register', async (req, res) => {
-  const { nombre, email, contrasena, carreras, rol } = req.body;
-
+    const { nombre, email, contrasena, carreras, rol } = req.body;
   if (!nombre || !email || !contrasena) {
     return res.status(400).json({ error: 'Faltan datos.' });
   }
@@ -176,7 +177,7 @@ app.post('/register', async (req, res) => {
 
     db.query(
       'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
-      [nombre, email, contrasena, esProfesor ? 'profesor' : 'estudiante'],
+            [nombre, email, bcrypt.hashSync(String(contrasena), 10), esProfesor ? 'profesor' : 'estudiante'],
       (err2, result) => {
         if (err2) {
           console.log('Error al registrar:', err2);
@@ -191,6 +192,9 @@ app.post('/register', async (req, res) => {
   });
 });
 
+// ---------- contraseñas con bcrypt ----------
+const esHash = (s) => /^\$2[aby]\$/.test(String(s || ''));
+
 app.post('/login', (req, res) => {
   const { email, contrasena } = req.body;
 
@@ -199,21 +203,134 @@ app.post('/login', (req, res) => {
   }
 
   db.query(
-    'SELECT id, nombre, email, rol, foto FROM usuarios WHERE email = ? AND contraseña = ?',
-    [email, contrasena],
-    (err, results) => {
+    'SELECT id, nombre, email, rol, foto, contraseña FROM usuarios WHERE email = ?',
+    [email],
+    async (err, results) => {
       if (err) {
         console.log('Error en login:', err);
         return res.status(500).json({ error: 'Error del servidor.' });
       }
-      if (results.length === 0) {
-        return res.status(401).json({ error: 'Email o contraseña incorrectos.' });
+      const u = results[0];
+      let ok = false;
+      if (u) {
+        if (esHash(u.contraseña)) {
+          ok = await bcrypt.compare(String(contrasena), u.contraseña);
+        } else if (u.contraseña === contrasena) {
+          // contraseña vieja (texto plano): entra y la guardamos encriptada
+          ok = true;
+          db.query('UPDATE usuarios SET contraseña = ? WHERE id = ?', [bcrypt.hashSync(String(contrasena), 10), u.id], () => {});
+        }
       }
-      res.json({ usuario: results[0] });
+      if (!ok) return res.status(401).json({ error: 'Email o contraseña incorrectos.' });
+      const { contraseña, ...usuario } = u;
+      res.json({ usuario });
     }
   );
 });
 
+/* ============================================================
+   Recuperar contraseña (código de 6 dígitos por mail)
+   ============================================================ */
+
+async function mandarMail(para, asunto, texto) {
+  const r = await fetch(process.env.MAIL_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ token: process.env.MAIL_TOKEN, para, asunto, texto }),
+    redirect: 'follow',
+  });
+  const d = await r.json().catch(() => null);
+  if (!r.ok || !d || !d.ok) throw new Error(`Script de mail ${r.status}: ${d ? d.error : 'sin respuesta'}`);
+}
+
+// máximo 5 pedidos de código por IP cada 15 minutos
+const pedidosReset = new Map();
+function reseteoLimitado(ip) {
+  const ahora = Date.now();
+  const r = (pedidosReset.get(ip) || []).filter((t) => ahora - t < 15 * 60 * 1000);
+  const limitado = r.length >= 5;
+  if (!limitado) r.push(ahora);
+  pedidosReset.set(ip, r);
+  return limitado;
+}
+
+// POST /olvide-contrasena  { email }   (siempre responde igual, exista o no el email)
+app.post('/olvide-contrasena', (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Ingresá un email válido.' });
+  if (reseteoLimitado(req.ip)) return res.status(429).json({ error: 'Demasiados pedidos. Probá de nuevo en unos minutos.' });
+
+  db.query('SELECT id FROM usuarios WHERE email = ?', [email], (err, rows) => {
+    if (err) {
+      console.log('Error en olvide-contrasena:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    if (rows.length === 0) return res.json({ ok: true });
+    const uid = rows[0].id;
+    const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    db.query(
+      'REPLACE INTO reset_contrasena (usuario_id, codigo_hash, vence, intentos) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), 0)',
+      [uid, bcrypt.hashSync(codigo, 8)],
+      async (err2) => {
+        if (err2) {
+          console.log('Error al guardar código:', err2);
+          return res.status(500).json({ error: 'Error del servidor.' });
+        }
+        try {
+          await mandarMail(
+            email,
+            'Tu código de UNM Connect',
+            `Tu código para crear una contraseña nueva es: ${codigo}\n\nVence en 15 minutos. Si no lo pediste vos, ignorá este mail.`
+          );
+          res.json({ ok: true });
+        } catch (e) {
+          console.log('Error al mandar mail:', e.message);
+          res.status(500).json({ error: 'No pudimos enviar el mail. Probá de nuevo más tarde.' });
+        }
+      }
+    );
+  });
+});
+
+// POST /restablecer-contrasena  { email, codigo, contrasena }
+app.post('/restablecer-contrasena', (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const codigo = String(req.body.codigo || '').trim();
+  const nueva = String(req.body.contrasena || '');
+  if (!/^\d{6}$/.test(codigo)) return res.status(400).json({ error: 'El código tiene 6 dígitos.' });
+  if (nueva.length < 6 || nueva.length > 100) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
+  const MALO = { error: 'El código es incorrecto o venció.' };
+
+  db.query(
+    `SELECT u.id, r.codigo_hash, r.intentos, (r.vence > NOW()) AS vigente
+     FROM usuarios u JOIN reset_contrasena r ON r.usuario_id = u.id
+     WHERE u.email = ?`,
+    [email],
+    async (err, rows) => {
+      if (err) {
+        console.log('Error en restablecer-contrasena:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      if (rows.length === 0) return res.status(400).json(MALO);
+      const r = rows[0];
+      if (!r.vigente || r.intentos >= 5) {
+        db.query('DELETE FROM reset_contrasena WHERE usuario_id = ?', [r.id], () => {});
+        return res.status(400).json(MALO);
+      }
+      if (!(await bcrypt.compare(codigo, r.codigo_hash))) {
+        db.query('UPDATE reset_contrasena SET intentos = intentos + 1 WHERE usuario_id = ?', [r.id], () => {});
+        return res.status(400).json(MALO);
+      }
+      db.query('UPDATE usuarios SET contraseña = ? WHERE id = ?', [bcrypt.hashSync(nueva, 10), r.id], (err2) => {
+        if (err2) {
+          console.log('Error al cambiar contraseña:', err2);
+          return res.status(500).json({ error: 'No se pudo guardar.' });
+        }
+        db.query('DELETE FROM reset_contrasena WHERE usuario_id = ?', [r.id], () => res.json({ ok: true }));
+      });
+    }
+  );
+});
 /* ============================================================
    Datos académicos (base de las compañeras)
    ============================================================ */
