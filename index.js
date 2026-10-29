@@ -449,7 +449,31 @@ app.get('/materias/carreras', (req, res) => {
     res.json(rows);
   });
 });
-
+// GET /carreras/:id/plan -> [{ nombre, anio, cuatri, electiva }]  (plan de estudios, de carrera_materias)
+app.get('/carreras/:id/plan', (req, res) => {
+  const cid = Number(req.params.id);
+  if (!Number.isInteger(cid) || cid <= 0) return res.status(400).json({ error: 'Carrera inválida.' });
+  dbAcad.query(
+    `SELECT m.nombre, m.anio, m.cuatrimestre, m.es_electiva
+     FROM carrera_materias cm
+     JOIN materias m ON m.id = cm.materia_id
+     WHERE cm.carrera_id = ?
+     ORDER BY m.anio, m.cuatrimestre, m.nombre`,
+    [cid],
+    (err, rows) => {
+      if (err) {
+        console.log('Error en /carreras/:id/plan:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      res.json(rows.map((r) => ({
+        nombre: r.nombre,
+        anio: Number(r.anio) || 0,
+        cuatri: Number(r.cuatrimestre) || 0,
+        electiva: r.es_electiva === 1 || r.es_electiva === true,
+      })));
+    }
+  );
+});
 /* ============================================================
    Perfil: nombre, email y foto
    ============================================================ */
