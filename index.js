@@ -109,7 +109,7 @@ async function buscarDocente(nombre, carreras) {
   const ids = [...new Set((Array.isArray(carreras) ? carreras : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   if (ids.length === 0) return null;
 
-  const [mc] = await db.promise().query('SELECT DISTINCT materia FROM materia_carreras WHERE carrera_id IN (?)', [ids]);
+   const [mc] = await dbAcad.promise().query('SELECT DISTINCT m.nombre AS materia FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id WHERE cm.carrera_id IN (?)', [ids]);
   const materiasDeLaCarrera = new Set(mc.map((r) => norm(r.materia)));
 
   const [dicta] = await dbAcad.promise().query(
@@ -441,7 +441,7 @@ app.put('/usuarios/:id/carreras', (req, res) => {
 
 // GET /materias/carreras -> [{ materia, carrera_id }]  (qué materia es de qué carrera)
 app.get('/materias/carreras', (req, res) => {
-  db.query('SELECT materia, carrera_id FROM materia_carreras', (err, rows) => {
+   dbAcad.query(`SELECT DISTINCT m.nombre AS materia, cm.carrera_id FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id`, (err, rows) => {
     if (err) {
       console.log('Error en /materias/carreras:', err);
       return res.status(500).json({ error: 'Error del servidor.' });
@@ -615,6 +615,55 @@ app.put('/usuarios/:id/notificaciones', (req, res) => {
       return res.status(500).json({ error: 'No se pudo guardar.' });
     }
     res.json({ ok: true });
+  });
+});
+/* ============================================================
+   Progreso de la carrera (planilla de materias)
+   ============================================================ */
+
+// GET /usuarios/:id/progreso -> { datos: { "Materia": { estado, nota? } } }
+app.get('/usuarios/:id/progreso', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query('SELECT materia, estado, nota FROM progreso_materias WHERE usuario_id = ?', [uid], (err, rows) => {
+    if (err) {
+      console.log('Error al leer progreso:', err);
+      return res.status(500).json({ error: 'Error del servidor.' });
+    }
+    const datos = {};
+    for (const r of rows) {
+      datos[r.materia] = r.nota == null ? { estado: r.estado } : { estado: r.estado, nota: Number(r.nota) };
+    }
+    res.json({ datos });
+  });
+});
+
+// PUT /usuarios/:id/progreso  { datos }  (reemplaza todo el progreso del usuario)
+app.put('/usuarios/:id/progreso', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  const datos = req.body && req.body.datos && typeof req.body.datos === 'object' ? req.body.datos : {};
+  const filas = [];
+  for (const [materia, r] of Object.entries(datos)) {
+    if (!materia || materia.length > 160 || !r) continue;
+    if (r.estado !== 'cursando' && r.estado !== 'aprobada') continue;
+    const n = Number(r.nota);
+    const nota = r.estado === 'aprobada' && Number.isFinite(n) && n >= 1 && n <= 10 ? Math.round(n * 10) / 10 : null;
+    filas.push([uid, materia, r.estado, nota]);
+  }
+  db.query('DELETE FROM progreso_materias WHERE usuario_id = ?', [uid], (err) => {
+    if (err) {
+      console.log('Error al limpiar progreso:', err);
+      return res.status(500).json({ error: 'No se pudo guardar.' });
+    }
+    if (filas.length === 0) return res.json({ ok: true });
+    db.query('INSERT INTO progreso_materias (usuario_id, materia, estado, nota) VALUES ?', [filas], (err2) => {
+      if (err2) {
+        console.log('Error al guardar progreso:', err2);
+        return res.status(500).json({ error: 'No se pudo guardar.' });
+      }
+      res.json({ ok: true });
+    });
   });
 });
 
