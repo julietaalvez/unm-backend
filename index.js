@@ -111,7 +111,10 @@ async function buscarDocente(nombre, carreras) {
   const ids = [...new Set((Array.isArray(carreras) ? carreras : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   if (ids.length === 0) return null;
 
-   const [mc] = await dbAcad.promise().query('SELECT DISTINCT m.nombre AS materia FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id WHERE cm.carrera_id IN (?)', [ids]);
+  const [mc] = await dbAcad.promise().query(
+    'SELECT DISTINCT m.nombre AS materia FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id WHERE cm.carrera_id IN (?)',
+    [ids]
+  );
   const materiasDeLaCarrera = new Set(mc.map((r) => norm(r.materia)));
 
   const [dicta] = await dbAcad.promise().query(
@@ -142,7 +145,7 @@ async function docenteYaRegistrado(docente) {
    ============================================================ */
 
 app.post('/register', async (req, res) => {
-    const { nombre, email, contrasena, carreras, rol } = req.body;
+  const { nombre, email, contrasena, carreras, rol } = req.body;
   if (!nombre || !email || !contrasena) {
     return res.status(400).json({ error: 'Faltan datos.' });
   }
@@ -177,7 +180,7 @@ app.post('/register', async (req, res) => {
 
     db.query(
       'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
-            [nombre, email, bcrypt.hashSync(String(contrasena), 10), esProfesor ? 'profesor' : 'estudiante'],
+      [nombre, email, bcrypt.hashSync(String(contrasena), 10), esProfesor ? 'profesor' : 'estudiante'],
       (err2, result) => {
         if (err2) {
           console.log('Error al registrar:', err2);
@@ -331,6 +334,7 @@ app.post('/restablecer-contrasena', (req, res) => {
     }
   );
 });
+
 /* ============================================================
    Datos académicos (base de las compañeras)
    ============================================================ */
@@ -558,14 +562,18 @@ app.put('/usuarios/:id/carreras', (req, res) => {
 
 // GET /materias/carreras -> [{ materia, carrera_id }]  (qué materia es de qué carrera)
 app.get('/materias/carreras', (req, res) => {
-   dbAcad.query(`SELECT DISTINCT m.nombre AS materia, cm.carrera_id FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id`, (err, rows) => {
-    if (err) {
-      console.log('Error en /materias/carreras:', err);
-      return res.status(500).json({ error: 'Error del servidor.' });
+  dbAcad.query(
+    'SELECT DISTINCT m.nombre AS materia, cm.carrera_id FROM carrera_materias cm JOIN materias m ON m.id = cm.materia_id',
+    (err, rows) => {
+      if (err) {
+        console.log('Error en /materias/carreras:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      res.json(rows);
     }
-    res.json(rows);
-  });
+  );
 });
+
 // GET /carreras/:id/plan -> [{ nombre, anio, cuatri, electiva }]  (plan de estudios, de carrera_materias)
 app.get('/carreras/:id/plan', (req, res) => {
   const cid = Number(req.params.id);
@@ -591,6 +599,7 @@ app.get('/carreras/:id/plan', (req, res) => {
     }
   );
 });
+
 /* ============================================================
    Perfil: nombre, email y foto
    ============================================================ */
@@ -666,6 +675,8 @@ const uidValido = (v) => {
 };
 
 // GET /usuarios/:id/novedades -> las que le corresponden a este usuario, con { leida }
+// Una novedad con comisión llega solo a los inscriptos en esa comisión.
+// Una sin comisión llega a todos los que cursan la materia (o a todos, si no tiene materia).
 app.get('/usuarios/:id/novedades', (req, res) => {
   const uid = uidValido(req.params.id);
   if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
@@ -675,10 +686,13 @@ app.get('/usuarios/:id/novedades', (req, res) => {
      FROM novedades n
      LEFT JOIN novedades_leidas l ON l.novedad_id = n.id AND l.usuario_id = ?
      WHERE n.materia IS NULL
-        OR n.materia IN (SELECT DISTINCT SUBSTRING_INDEX(clave, '|', 1) FROM inscripciones WHERE usuario_id = ?)
+        OR (n.comision IS NULL AND n.materia IN
+              (SELECT DISTINCT SUBSTRING_INDEX(clave, '|', 1) FROM inscripciones WHERE usuario_id = ?))
+        OR (n.comision IS NOT NULL AND CONCAT(n.materia, '|', n.comision) IN
+              (SELECT clave FROM inscripciones WHERE usuario_id = ?))
      ORDER BY n.fecha DESC, n.id DESC
      LIMIT 50`,
-    [uid, uid],
+    [uid, uid, uid],
     (err, rows) => {
       if (err) {
         console.log('Error en novedades del usuario:', err);
@@ -734,6 +748,7 @@ app.put('/usuarios/:id/notificaciones', (req, res) => {
     res.json({ ok: true });
   });
 });
+
 /* ============================================================
    Progreso de la carrera (planilla de materias)
    ============================================================ */
@@ -782,6 +797,98 @@ app.put('/usuarios/:id/progreso', (req, res) => {
       res.json({ ok: true });
     });
   });
+});
+
+/* ============================================================
+   Avisos de docentes a sus alumnos
+   ============================================================ */
+
+// Busca al docente detrás de una cuenta (rol profesor) en la base académica
+async function docenteDe(uid) {
+  const [u] = await db.promise().query('SELECT nombre, rol FROM usuarios WHERE id = ?', [uid]);
+  if (!u.length || u[0].rol !== 'profesor') return null;
+  const [c] = await db.promise().query('SELECT carrera_id FROM usuario_carreras WHERE usuario_id = ?', [uid]);
+  const docente = await buscarDocente(u[0].nombre, c.map((r) => r.carrera_id));
+  return docente ? { usuario: u[0], docente } : null;
+}
+
+// Las comisiones que dicta ese docente
+async function comisionesDe(profesorId) {
+  const [rows] = await dbAcad.promise().query(
+    `SELECT DISTINCT m.nombre AS materia, COALESCE(c.codigo, '') AS comision
+     FROM comision_docentes cd
+     JOIN comisiones c ON c.id = cd.comision_id
+     JOIN materias m ON m.id = c.materia_id
+     WHERE cd.profesor_id = ?
+     ORDER BY m.nombre, c.codigo`,
+    [profesorId]
+  );
+  return rows;
+}
+
+// GET /docentes/:id/comisiones -> [{ materia, comision, alumnos }]
+app.get('/docentes/:id/comisiones', async (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  try {
+    const d = await docenteDe(uid);
+    if (!d) return res.status(403).json({ error: 'Tu cuenta no figura como docente.' });
+    const comisiones = await comisionesDe(d.docente.id);
+    const claves = comisiones.map((c) => `${c.materia}|${c.comision}`);
+    let conteo = new Map();
+    if (claves.length) {
+      const [rows] = await db.promise().query(
+        'SELECT clave, COUNT(DISTINCT usuario_id) AS n FROM inscripciones WHERE clave IN (?) GROUP BY clave',
+        [claves]
+      );
+      conteo = new Map(rows.map((r) => [r.clave, Number(r.n)]));
+    }
+    res.json(comisiones.map((c) => ({ ...c, alumnos: conteo.get(`${c.materia}|${c.comision}`) || 0 })));
+  } catch (e) {
+    console.log('Error en /docentes/comisiones:', e);
+    res.status(500).json({ error: 'Error del servidor.' });
+  }
+});
+
+// POST /docentes/:id/avisos  { claves: ["Materia|comisión"], titulo, texto }
+app.post('/docentes/:id/avisos', async (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+
+  const titulo = String(req.body.titulo ?? '').trim();
+  const texto = String(req.body.texto ?? '').trim();
+  const claves = [...new Set((Array.isArray(req.body.claves) ? req.body.claves : []).filter((c) => typeof c === 'string' && c.includes('|')))];
+
+  if (!titulo || titulo.length > 60 || !texto || texto.length > 300) {
+    return res.status(400).json({ error: 'El título o el mensaje no son válidos.' });
+  }
+  if (claves.length === 0 || claves.length > 50) {
+    return res.status(400).json({ error: 'Elegí a quién va el aviso.' });
+  }
+
+  try {
+    const d = await docenteDe(uid);
+    if (!d) return res.status(403).json({ error: 'Tu cuenta no figura como docente.' });
+
+    const propias = new Set((await comisionesDe(d.docente.id)).map((c) => `${c.materia}|${c.comision}`));
+    if (!claves.every((c) => propias.has(c))) {
+      return res.status(403).json({ error: 'Solo podés avisar a las comisiones que dictás.' });
+    }
+
+    const ahora = new Date();
+    const filas = claves.map((c) => {
+      const i = c.indexOf('|');
+      return [titulo, texto, 'aviso', c.slice(0, i), c.slice(i + 1), uid, ahora];
+    });
+    await db.promise().query(
+      'INSERT INTO novedades (titulo, texto, tipo, materia, comision, autor_id, fecha) VALUES ?',
+      [filas]
+    );
+    res.json({ ok: true, enviados: filas.length });
+  } catch (e) {
+    console.log('Error al enviar aviso:', e);
+    res.status(500).json({ error: 'No se pudo enviar el aviso.' });
+  }
 });
 
 app.listen(process.env.PORT || 3000, () =>
