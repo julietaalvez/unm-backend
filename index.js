@@ -900,6 +900,39 @@ app.get('/docentes/:id/comisiones', async (req, res) => {
   }
 });
 
+// GET /docentes/:id/comisiones/alumnos -> [{ materia, comision, alumnos: [{ id, nombre, desde }] }]
+// Solo nombre y fecha de inscripción: sin DNI ni email.
+app.get('/docentes/:id/comisiones/alumnos', async (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  try {
+    const d = await docenteDe(uid);
+    if (!d) return res.status(403).json({ error: 'Tu cuenta no figura como docente.' });
+
+    const comisiones = await comisionesDe(d.docente.id);
+    const claves = comisiones.map((c) => `${c.materia}|${c.comision}`);
+    const porClave = new Map();
+    if (claves.length) {
+      const [rows] = await db.promise().query(
+        `SELECT i.clave, u.id, u.nombre, i.creada
+         FROM inscripciones i
+         JOIN usuarios u ON u.id = i.usuario_id
+         WHERE i.clave IN (?) AND u.rol = 'estudiante'
+         ORDER BY u.nombre`,
+        [claves]
+      );
+      for (const r of rows) {
+        if (!porClave.has(r.clave)) porClave.set(r.clave, []);
+        porClave.get(r.clave).push({ id: r.id, nombre: r.nombre, desde: r.creada });
+      }
+    }
+    res.json(comisiones.map((c) => ({ ...c, alumnos: porClave.get(`${c.materia}|${c.comision}`) || [] })));
+  } catch (e) {
+    console.log('Error en /docentes/comisiones/alumnos:', e);
+    res.status(500).json({ error: 'Error del servidor.' });
+  }
+});
+
 // POST /docentes/:id/avisos  { claves: ["Materia|comisión"], titulo, texto }
 app.post('/docentes/:id/avisos', async (req, res) => {
   const uid = uidValido(req.params.id);
@@ -939,6 +972,196 @@ app.post('/docentes/:id/avisos', async (req, res) => {
     console.log('Error al enviar aviso:', e);
     res.status(500).json({ error: 'No se pudo enviar el aviso.' });
   }
+});
+
+/* ============================================================
+   Evaluaciones y notas (carga manual del docente)
+   ============================================================ */
+
+const ESTADOS = ['borrador', 'programada', 'publicada'];
+
+// Fecha UTC 'YYYY-MM-DD HH:MM:SS', o null si es inválida
+const fechaUtc = (v) => {
+  const d = new Date(v);
+  return isNaN(d) ? null : d.toISOString().slice(0, 19).replace('T', ' ');
+};
+
+const errSrv = (res, e) => {
+  console.log(e);
+  res.status(500).json({ error: 'Error del servidor.' });
+};
+
+// El docente existe, es profesor y dicta en esa carrera
+const docenteDeCarrera = (docenteId, carreraId, cb) =>
+  db.query(
+    `SELECT u.id FROM usuarios u
+     JOIN usuario_carreras uc ON uc.usuario_id = u.id
+     WHERE u.id = ? AND u.rol = 'profesor' AND uc.carrera_id = ?`,
+    [docenteId, carreraId],
+    (err, rows) => cb(err, !err && rows.length > 0)
+  );
+
+// La evaluación existe y es de ese docente
+const evaluacionDe = (evalId, docenteId, cb) =>
+  db.query('SELECT * FROM evaluaciones WHERE id = ? AND docente_id = ?', [evalId, docenteId],
+    (err, rows) => cb(err, rows && rows[0]));
+
+// POST /evaluaciones { docente_id, carrera_id, nombre, estado, publicar_en }
+app.post('/evaluaciones', (req, res) => {
+  const docenteId = uidValido(req.body.docente_id);
+  const carreraId = uidValido(req.body.carrera_id);
+  const nombre = String(req.body.nombre ?? '').trim();
+  const estado = req.body.estado || 'borrador';
+  if (!docenteId || !carreraId) return res.status(400).json({ error: 'Datos inválidos.' });
+  if (!nombre || nombre.length > 120) return res.status(400).json({ error: 'Poné un nombre de hasta 120 caracteres.' });
+  if (!ESTADOS.includes(estado)) return res.status(400).json({ error: 'Estado inválido.' });
+
+  let publicarEn = null;
+  if (estado === 'programada') {
+    publicarEn = fechaUtc(req.body.publicar_en);
+    if (!publicarEn) return res.status(400).json({ error: 'Indicá la fecha de publicación.' });
+  }
+
+  docenteDeCarrera(docenteId, carreraId, (err, ok) => {
+    if (err) return errSrv(res, err);
+    if (!ok) return res.status(403).json({ error: 'No dictás en esa carrera.' });
+    db.query(
+      'INSERT INTO evaluaciones (carrera_id, docente_id, nombre, estado, publicar_en) VALUES (?, ?, ?, ?, ?)',
+      [carreraId, docenteId, nombre, estado, publicarEn],
+      (err2, r) => (err2 ? errSrv(res, err2) : res.json({ id: r.insertId }))
+    );
+  });
+});
+
+// GET /evaluaciones?docente_id=  -> evaluaciones del docente
+app.get('/evaluaciones', (req, res) => {
+  const docenteId = uidValido(req.query.docente_id);
+  if (!docenteId) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query(
+    `SELECT e.id, e.nombre, e.estado, e.publicar_en, e.carrera_id,
+            (SELECT COUNT(*) FROM notas n WHERE n.evaluacion_id = e.id) AS cargadas
+     FROM evaluaciones e WHERE e.docente_id = ? ORDER BY e.creada_en DESC`,
+    [docenteId],
+    (err, rows) => (err ? errSrv(res, err) : res.json({ evaluaciones: rows }))
+  );
+});
+
+// PUT /evaluaciones/:id { docente_id, nombre?, estado?, publicar_en? }
+app.put('/evaluaciones/:id', (req, res) => {
+  const evalId = uidValido(req.params.id);
+  const docenteId = uidValido(req.body.docente_id);
+  if (!evalId || !docenteId) return res.status(400).json({ error: 'Datos inválidos.' });
+
+  evaluacionDe(evalId, docenteId, (err, ev) => {
+    if (err) return errSrv(res, err);
+    if (!ev) return res.status(404).json({ error: 'Evaluación no encontrada.' });
+
+    const nombre = req.body.nombre !== undefined ? String(req.body.nombre).trim() : ev.nombre;
+    const estado = req.body.estado ?? ev.estado;
+    if (!nombre || nombre.length > 120) return res.status(400).json({ error: 'Nombre inválido.' });
+    if (!ESTADOS.includes(estado)) return res.status(400).json({ error: 'Estado inválido.' });
+
+    let publicarEn = null;
+    if (estado === 'programada') {
+      publicarEn = fechaUtc(req.body.publicar_en ?? ev.publicar_en);
+      if (!publicarEn) return res.status(400).json({ error: 'Indicá la fecha de publicación.' });
+    }
+    db.query(
+      'UPDATE evaluaciones SET nombre = ?, estado = ?, publicar_en = ? WHERE id = ?',
+      [nombre, estado, publicarEn, evalId],
+      (err2) => (err2 ? errSrv(res, err2) : res.json({ ok: true }))
+    );
+  });
+});
+
+// DELETE /evaluaciones/:id?docente_id=
+app.delete('/evaluaciones/:id', (req, res) => {
+  const evalId = uidValido(req.params.id);
+  const docenteId = uidValido(req.query.docente_id);
+  if (!evalId || !docenteId) return res.status(400).json({ error: 'Datos inválidos.' });
+  db.query('DELETE FROM evaluaciones WHERE id = ? AND docente_id = ?', [evalId, docenteId],
+    (err, r) => {
+      if (err) return errSrv(res, err);
+      if (r.affectedRows === 0) return res.status(404).json({ error: 'Evaluación no encontrada.' });
+      res.json({ ok: true });
+    });
+});
+
+// GET /evaluaciones/:id/alumnos?docente_id=&q=  -> alumnos de la carrera con su nota (si ya tiene). Sin DNI.
+app.get('/evaluaciones/:id/alumnos', (req, res) => {
+  const evalId = uidValido(req.params.id);
+  const docenteId = uidValido(req.query.docente_id);
+  if (!evalId || !docenteId) return res.status(400).json({ error: 'Datos inválidos.' });
+  const q = String(req.query.q ?? '').trim().slice(0, 60);
+
+  evaluacionDe(evalId, docenteId, (err, ev) => {
+    if (err) return errSrv(res, err);
+    if (!ev) return res.status(404).json({ error: 'Evaluación no encontrada.' });
+    db.query(
+      `SELECT u.id, u.nombre, n.valor AS nota
+       FROM usuarios u
+       JOIN usuario_carreras uc ON uc.usuario_id = u.id AND uc.carrera_id = ?
+       LEFT JOIN notas n ON n.alumno_id = u.id AND n.evaluacion_id = ?
+       WHERE u.rol = 'estudiante' AND u.nombre LIKE ?
+       ORDER BY u.nombre LIMIT 50`,
+      [ev.carrera_id, evalId, `%${q.replace(/[%_]/g, '')}%`],
+      (err2, rows) => (err2 ? errSrv(res, err2) : res.json({ alumnos: rows }))
+    );
+  });
+});
+
+// PUT /evaluaciones/:id/notas/:alumnoId { docente_id, valor }  -> crea o actualiza. Valor vacío = borra la nota.
+app.put('/evaluaciones/:id/notas/:alumnoId', (req, res) => {
+  const evalId = uidValido(req.params.id);
+  const alumnoId = uidValido(req.params.alumnoId);
+  const docenteId = uidValido(req.body.docente_id);
+  const valor = String(req.body.valor ?? '').trim();
+  if (!evalId || !alumnoId || !docenteId) return res.status(400).json({ error: 'Datos inválidos.' });
+  if (valor.length > 40) return res.status(400).json({ error: 'La nota es demasiado larga (máx. 40).' });
+
+  evaluacionDe(evalId, docenteId, (err, ev) => {
+    if (err) return errSrv(res, err);
+    if (!ev) return res.status(404).json({ error: 'Evaluación no encontrada.' });
+
+    if (!valor) {
+      return db.query('DELETE FROM notas WHERE evaluacion_id = ? AND alumno_id = ?', [evalId, alumnoId],
+        (e2) => (e2 ? errSrv(res, e2) : res.json({ ok: true, nota: null })));
+    }
+    // El alumno tiene que cursar la carrera de la evaluación
+    db.query(
+      `SELECT u.id FROM usuarios u
+       JOIN usuario_carreras uc ON uc.usuario_id = u.id AND uc.carrera_id = ?
+       WHERE u.id = ? AND u.rol = 'estudiante'`,
+      [ev.carrera_id, alumnoId],
+      (e3, rows) => {
+        if (e3) return errSrv(res, e3);
+        if (rows.length === 0) return res.status(404).json({ error: 'Alumno no encontrado en esta carrera.' });
+        db.query(
+          `INSERT INTO notas (evaluacion_id, alumno_id, valor) VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE valor = VALUES(valor)`,
+          [evalId, alumnoId, valor],
+          (e4) => (e4 ? errSrv(res, e4) : res.json({ ok: true, nota: valor }))
+        );
+      }
+    );
+  });
+});
+
+// GET /alumnos/:id/notas  -> solo las notas visibles (publicadas, o programadas cuya hora ya pasó)
+app.get('/alumnos/:id/notas', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  db.query(
+    `SELECT e.id AS evaluacion_id, e.nombre AS evaluacion, c.nombre AS carrera, n.valor AS nota
+     FROM notas n
+     JOIN evaluaciones e ON e.id = n.evaluacion_id
+     JOIN carreras c ON c.id = e.carrera_id
+     WHERE n.alumno_id = ?
+       AND (e.estado = 'publicada' OR (e.estado = 'programada' AND e.publicar_en <= UTC_TIMESTAMP()))
+     ORDER BY e.creada_en DESC`,
+    [uid],
+    (err, rows) => (err ? errSrv(res, err) : res.json({ notas: rows }))
+  );
 });
 
 app.listen(process.env.PORT || 3000, () =>
