@@ -141,6 +141,14 @@ async function docenteYaRegistrado(docente) {
 }
 
 /* ============================================================
+   DNI
+   ============================================================ */
+
+// DNI argentino: 7 u 8 números. Se guarda como texto, sin puntos ni espacios.
+const DNI_RE = /^\d{7,8}$/;
+const limpiarDni = (v) => String(v ?? '').replace(/[.\s]/g, '');
+
+/* ============================================================
    Registro y login
    ============================================================ */
 
@@ -151,6 +159,13 @@ app.post('/register', async (req, res) => {
   }
 
   const esProfesor = rol === 'profesor';
+
+  // DNI obligatorio para alumnos. Los docentes se validan contra la base académica, así que es opcional.
+  const dni = limpiarDni(req.body.dni);
+  if ((!esProfesor || dni) && !DNI_RE.test(dni)) {
+    return res.status(400).json({ error: 'Ingresá tu DNI: 7 u 8 números, sin puntos.' });
+  }
+  const dniGuardar = dni || null;
 
   if (esProfesor) {
     if (bloqueado(req.ip)) {
@@ -169,30 +184,40 @@ app.post('/register', async (req, res) => {
     }
   }
 
-  db.query('SELECT id FROM usuarios WHERE email = ?', [email], (err, results) => {
-    if (err) {
-      console.log('Error al verificar email:', err);
-      return res.status(500).json({ error: 'Error del servidor.' });
-    }
-    if (results.length > 0) {
-      return res.status(409).json({ error: 'Ese email ya está registrado.' });
-    }
-
-    db.query(
-      'INSERT INTO usuarios (nombre, email, contraseña, rol) VALUES (?, ?, ?, ?)',
-      [nombre, email, bcrypt.hashSync(String(contrasena), 10), esProfesor ? 'profesor' : 'estudiante'],
-      (err2, result) => {
-        if (err2) {
-          console.log('Error al registrar:', err2);
-          return res.status(500).json({ error: 'No se pudo registrar.' });
-        }
-        guardarCarreras(result.insertId, carreras, (err3) => {
-          if (err3) console.log('Error al guardar carreras:', err3);
-          res.json({ ok: true });
+  db.query(
+    'SELECT email FROM usuarios WHERE email = ? OR (dni IS NOT NULL AND dni = ?)',
+    [email, dniGuardar],
+    (err, results) => {
+      if (err) {
+        console.log('Error al verificar email/dni:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      if (results.length > 0) {
+        const mismoEmail = results.some((r) => String(r.email).toLowerCase() === String(email).toLowerCase());
+        return res.status(409).json({
+          error: mismoEmail ? 'Ese email ya está registrado.' : 'Ese DNI ya está registrado.',
         });
       }
-    );
-  });
+
+      db.query(
+        'INSERT INTO usuarios (nombre, email, contraseña, rol, dni) VALUES (?, ?, ?, ?, ?)',
+        [nombre, email, bcrypt.hashSync(String(contrasena), 10), esProfesor ? 'profesor' : 'estudiante', dniGuardar],
+        (err2, result) => {
+          if (err2) {
+            if (err2.code === 'ER_DUP_ENTRY') {
+              return res.status(409).json({ error: 'Ese email o DNI ya está registrado.' });
+            }
+            console.log('Error al registrar:', err2);
+            return res.status(500).json({ error: 'No se pudo registrar.' });
+          }
+          guardarCarreras(result.insertId, carreras, (err3) => {
+            if (err3) console.log('Error al guardar carreras:', err3);
+            res.json({ ok: true });
+          });
+        }
+      );
+    }
+  );
 });
 
 // ---------- contraseñas con bcrypt ----------
@@ -206,7 +231,7 @@ app.post('/login', (req, res) => {
   }
 
   db.query(
-    'SELECT id, nombre, email, rol, foto, contraseña FROM usuarios WHERE email = ?',
+    'SELECT id, nombre, email, rol, foto, dni, contraseña FROM usuarios WHERE email = ?',
     [email],
     async (err, results) => {
       if (err) {
@@ -646,7 +671,7 @@ app.put('/usuarios/:id', (req, res) => {
         console.log('Error al actualizar usuario:', err);
         return res.status(500).json({ error: 'No se pudo guardar.' });
       }
-      db.query('SELECT id, nombre, email, rol, foto FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
+      db.query('SELECT id, nombre, email, rol, foto, dni FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
         if (err2 || rows.length === 0) return res.status(500).json({ error: 'Error del servidor.' });
         res.json({ usuario: rows[0] });
       });
@@ -662,6 +687,31 @@ app.put('/usuarios/:id', (req, res) => {
     }
     if (rows.length > 0) return res.status(409).json({ error: 'Ese email ya está registrado.' });
     actualizar();
+  });
+});
+
+// PUT /usuarios/:id/dni  { dni }  -> solo se puede cargar UNA vez; después queda de solo lectura
+app.put('/usuarios/:id/dni', (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) return res.status(400).json({ error: 'Usuario inválido.' });
+
+  const dni = limpiarDni(req.body.dni);
+  if (!DNI_RE.test(dni)) {
+    return res.status(400).json({ error: 'Ingresá tu DNI: 7 u 8 números, sin puntos.' });
+  }
+
+  db.query('UPDATE usuarios SET dni = ? WHERE id = ? AND dni IS NULL', [dni, uid], (err, r) => {
+    if (err) {
+      if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ese DNI ya está registrado.' });
+      console.log('Error al guardar DNI:', err);
+      return res.status(500).json({ error: 'No se pudo guardar.' });
+    }
+    if (r.affectedRows === 0) return res.status(409).json({ error: 'Esta cuenta ya tiene un DNI cargado.' });
+
+    db.query('SELECT id, nombre, email, rol, foto, dni FROM usuarios WHERE id = ?', [uid], (err2, rows) => {
+      if (err2 || rows.length === 0) return res.status(500).json({ error: 'Error del servidor.' });
+      res.json({ usuario: rows[0] });
+    });
   });
 });
 
