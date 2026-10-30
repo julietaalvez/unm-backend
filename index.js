@@ -870,7 +870,7 @@ async function comisionesDe(profesorId) {
      JOIN comisiones c ON c.id = cd.comision_id
      JOIN materias m ON m.id = c.materia_id
      WHERE cd.profesor_id = ?
-     ORDER BY m.nombre, c.codigo`,
+     ORDER BY m.nombre, comision`, // CAMBIO: antes decía c.codigo, que no está en el SELECT y MySQL lo rechaza con DISTINCT
     [profesorId]
   );
   return rows;
