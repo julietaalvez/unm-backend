@@ -727,28 +727,50 @@ const uidValido = (v) => {
 // GET /usuarios/:id/novedades -> las que le corresponden a este usuario, con { leida }
 // Una novedad con comisión llega solo a los inscriptos en esa comisión.
 // Una sin comisión llega a todos los que cursan la materia (o a todos, si no tiene materia).
+// Una con destinatario_id (por ejemplo, el aviso de una nota) llega solo a esa persona.
 app.get('/usuarios/:id/novedades', (req, res) => {
   const uid = uidValido(req.params.id);
   if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+
+  // Primero se crean los avisos de las notas que ya son visibles y todavía no tienen uno
   db.query(
-    `SELECT n.id, n.titulo, n.texto, n.tipo, n.materia, n.fecha,
-            (l.novedad_id IS NOT NULL) AS leida
-     FROM novedades n
-     LEFT JOIN novedades_leidas l ON l.novedad_id = n.id AND l.usuario_id = ?
-     WHERE n.materia IS NULL
-        OR (n.comision IS NULL AND n.materia IN
-              (SELECT DISTINCT SUBSTRING_INDEX(clave, '|', 1) FROM inscripciones WHERE usuario_id = ?))
-        OR (n.comision IS NOT NULL AND CONCAT(n.materia, '|', n.comision) IN
-              (SELECT clave FROM inscripciones WHERE usuario_id = ?))
-     ORDER BY n.fecha DESC, n.id DESC
-     LIMIT 50`,
-    [uid, uid, uid],
-    (err, rows) => {
-      if (err) {
-        console.log('Error en novedades del usuario:', err);
-        return res.status(500).json({ error: 'Error del servidor.' });
-      }
-      res.json(rows.map((r) => ({ ...r, leida: !!r.leida })));
+    `INSERT IGNORE INTO novedades (titulo, texto, tipo, destinatario_id, ref, fecha)
+     SELECT 'Nueva nota publicada',
+            CONCAT('Ya podés ver tu nota de ', e.nombre, ' en Mis notas.'),
+            'aviso', n.alumno_id, CONCAT('nota:', n.evaluacion_id), NOW()
+     FROM notas n
+     JOIN evaluaciones e ON e.id = n.evaluacion_id
+     WHERE n.alumno_id = ?
+       AND (e.estado = 'publicada' OR (e.estado = 'programada' AND e.publicar_en <= UTC_TIMESTAMP()))`,
+    [uid],
+    (errN) => {
+      if (errN) console.log('Error al generar avisos de notas:', errN);
+
+      // Después se devuelven las novedades del usuario, incluyendo las personales
+      db.query(
+        `SELECT n.id, n.titulo, n.texto, n.tipo, n.materia, n.fecha,
+                (l.novedad_id IS NOT NULL) AS leida
+         FROM novedades n
+         LEFT JOIN novedades_leidas l ON l.novedad_id = n.id AND l.usuario_id = ?
+         WHERE (n.destinatario_id IS NULL OR n.destinatario_id = ?)
+           AND (
+                n.materia IS NULL
+             OR (n.comision IS NULL AND n.materia IN
+                   (SELECT DISTINCT SUBSTRING_INDEX(clave, '|', 1) FROM inscripciones WHERE usuario_id = ?))
+             OR (n.comision IS NOT NULL AND CONCAT(n.materia, '|', n.comision) IN
+                   (SELECT clave FROM inscripciones WHERE usuario_id = ?))
+           )
+         ORDER BY n.fecha DESC, n.id DESC
+         LIMIT 50`,
+        [uid, uid, uid, uid],
+        (err, rows) => {
+          if (err) {
+            console.log('Error en novedades del usuario:', err);
+            return res.status(500).json({ error: 'Error del servidor.' });
+          }
+          res.json(rows.map((r) => ({ ...r, leida: !!r.leida })));
+        }
+      );
     }
   );
 });
@@ -862,7 +884,17 @@ async function docenteDe(uid) {
   return docente ? { usuario: u[0], docente } : null;
 }
 
-// Las comisiones que dicta ese docente
+// CAMBIO: cuatrimestre en curso (1 o 2), según el mes en Argentina.
+// Agosto a diciembre = 2.º; enero a julio = 1.º (incluye el verano, que es el que viene).
+function cuatriActual() {
+  const mes = Number(
+    new Intl.DateTimeFormat('en-US', { timeZone: 'America/Argentina/Buenos_Aires', month: 'numeric' }).format(new Date())
+  );
+  return mes >= 8 ? 2 : 1;
+}
+
+// CAMBIO: las comisiones que dicta ese docente en el cuatrimestre en curso.
+// Una materia sin cuatrimestre cargado (o anual) se muestra siempre.
 async function comisionesDe(profesorId) {
   const [rows] = await dbAcad.promise().query(
     `SELECT DISTINCT m.nombre AS materia, COALESCE(c.codigo, '') AS comision
@@ -870,8 +902,9 @@ async function comisionesDe(profesorId) {
      JOIN comisiones c ON c.id = cd.comision_id
      JOIN materias m ON m.id = c.materia_id
      WHERE cd.profesor_id = ?
-     ORDER BY m.nombre, comision`, // CAMBIO: antes decía c.codigo, que no está en el SELECT y MySQL lo rechaza con DISTINCT
-    [profesorId]
+       AND (m.cuatrimestre IS NULL OR m.cuatrimestre NOT IN (1, 2) OR m.cuatrimestre = ?)
+     ORDER BY m.nombre, comision`,
+    [profesorId, cuatriActual()]
   );
   return rows;
 }
