@@ -752,7 +752,8 @@ app.get('/usuarios/:id/novedades', (req, res) => {
                 (l.novedad_id IS NOT NULL) AS leida
          FROM novedades n
          LEFT JOIN novedades_leidas l ON l.novedad_id = n.id AND l.usuario_id = ?
-         WHERE (n.destinatario_id IS NULL OR n.destinatario_id = ?)
+         WHERE NOT EXISTS (SELECT 1 FROM novedades_ocultas o WHERE o.novedad_id = n.id AND o.usuario_id = ?)
+           AND (n.destinatario_id IS NULL OR n.destinatario_id = ?)
            AND (
                 n.materia IS NULL
              OR (n.comision IS NULL AND n.materia IN
@@ -762,7 +763,7 @@ app.get('/usuarios/:id/novedades', (req, res) => {
            )
          ORDER BY n.fecha DESC, n.id DESC
          LIMIT 50`,
-        [uid, uid, uid, uid],
+        [uid, uid, uid, uid, uid],
         (err, rows) => {
           if (err) {
             console.log('Error en novedades del usuario:', err);
@@ -793,7 +794,24 @@ app.post('/usuarios/:id/novedades/leer', (req, res) => {
     }
   );
 });
-
+// POST /usuarios/:id/novedades/ocultar  { ids: [1, 2] }  (las borra solo para este usuario)
+app.post('/usuarios/:id/novedades/ocultar', (req, res) => {
+  const uid = uidValido(req.params.id);
+  if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
+  const ids = [...new Set((Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (ids.length === 0) return res.json({ ok: true });
+  db.query(
+    'INSERT IGNORE INTO novedades_ocultas (usuario_id, novedad_id) SELECT ?, id FROM novedades WHERE id IN (?)',
+    [uid, ids],
+    (err) => {
+      if (err) {
+        console.log('Error al ocultar novedades:', err);
+        return res.status(500).json({ error: 'Error del servidor.' });
+      }
+      res.json({ ok: true });
+    }
+  );
+});
 // GET /usuarios/:id/notificaciones -> { push: true|false }
 app.get('/usuarios/:id/notificaciones', (req, res) => {
   const uid = uidValido(req.params.id);
