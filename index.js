@@ -856,11 +856,22 @@ app.get('/usuarios/:id/progreso', (req, res) => {
     for (const r of rows) {
       datos[r.materia] = r.nota == null ? { estado: r.estado } : { estado: r.estado, nota: Number(r.nota) };
     }
-    res.json({ datos });
+       // las notas finales cargadas por docentes pisan lo que haya puesto el alumno
+    db.query('SELECT materia, nota FROM notas_finales WHERE usuario_id = ?', [uid], (err2, fin) => {
+      if (err2) {
+        console.log('Error al leer notas finales:', err2);
+        return res.json({ datos });
+      }
+      for (const f of fin) {
+        const nota = Number(f.nota);
+        datos[f.materia] = { estado: nota >= 4 ? 'aprobada' : 'cursando', nota, final: true };
+      }
+      res.json({ datos });
+    });
   });
 });
 
-// PUT /usuarios/:id/progreso  { datos }  (reemplaza todo el progreso del usuario)
+// PUT /usuarios/:id/progreso { datos }  (reemplaza todo el progreso del usuario)
 app.put('/usuarios/:id/progreso', (req, res) => {
   const uid = uidValido(req.params.id);
   if (!uid) return res.status(400).json({ error: 'Usuario inválido.' });
@@ -869,6 +880,7 @@ app.put('/usuarios/:id/progreso', (req, res) => {
   for (const [materia, r] of Object.entries(datos)) {
     if (!materia || materia.length > 160 || !r) continue;
     if (r.estado !== 'cursando' && r.estado !== 'aprobada') continue;
+        if (r.final) continue; // las finales viven en notas_finales, no se copian acá
     const n = Number(r.nota);
     const nota = r.estado === 'aprobada' && Number.isFinite(n) && n >= 1 && n <= 10 ? Math.round(n * 10) / 10 : null;
     filas.push([uid, materia, r.estado, nota]);
@@ -972,9 +984,16 @@ app.get('/docentes/:id/comisiones/alumnos', async (req, res) => {
          ORDER BY u.nombre`,
         [claves]
       );
+          const ids = [...new Set(rows.map((r) => r.id))];
+      const finales = new Map();
+      if (ids.length) {
+        const [fin] = await db.promise().query('SELECT usuario_id, materia, nota FROM notas_finales WHERE usuario_id IN (?)', [ids]);
+        for (const f of fin) finales.set(`${f.usuario_id}|${f.materia}`, Number(f.nota));
+      }
       for (const r of rows) {
         if (!porClave.has(r.clave)) porClave.set(r.clave, []);
-        porClave.get(r.clave).push({ id: r.id, nombre: r.nombre, desde: r.creada });
+        const materia = r.clave.slice(0, r.clave.indexOf('|'));
+        porClave.get(r.clave).push({ id: r.id, nombre: r.nombre, desde: r.creada, final: finales.get(`${r.id}|${materia}`) ?? null });
       }
     }
     res.json(comisiones.map((c) => ({ ...c, alumnos: porClave.get(`${c.materia}|${c.comision}`) || [] })));
@@ -983,7 +1002,49 @@ app.get('/docentes/:id/comisiones/alumnos', async (req, res) => {
     res.status(500).json({ error: 'Error del servidor.' });
   }
 });
+// PUT /docentes/:id/finales  { materia, alumno_id, nota }   (nota vacía = borra la nota final)
+app.put('/docentes/:id/finales', async (req, res) => {
+  const uid = uidValido(req.params.id);
+  const alumnoId = uidValido(req.body.alumno_id);
+  const materia = String(req.body.materia ?? '').trim();
+  if (!uid || !alumnoId || !materia || materia.length > 160) return res.status(400).json({ error: 'Datos inválidos.' });
 
+  const crudo = String(req.body.nota ?? '').trim().replace(',', '.');
+  let nota = null;
+  if (crudo !== '') {
+    const n = Number(crudo);
+    if (!Number.isFinite(n) || n < 1 || n > 10) return res.status(400).json({ error: 'La nota tiene que estar entre 1 y 10.' });
+    nota = Math.round(n * 10) / 10;
+  }
+
+  try {
+    const d = await docenteDe(uid);
+    if (!d) return res.status(403).json({ error: 'Tu cuenta no figura como docente.' });
+
+    const mias = (await comisionesDe(d.docente.id)).filter((c) => c.materia === materia).map((c) => `${c.materia}|${c.comision}`);
+    if (!mias.length) return res.status(403).json({ error: 'Esa materia no figura entre tus comisiones.' });
+
+    const [ins] = await db.promise().query('SELECT 1 FROM inscripciones WHERE usuario_id = ? AND clave IN (?) LIMIT 1', [alumnoId, mias]);
+    if (!ins.length) return res.status(403).json({ error: 'Ese alumno no está anotado en tus comisiones.' });
+
+    if (nota === null) {
+      await db.promise().query('DELETE FROM notas_finales WHERE usuario_id = ? AND materia = ?', [alumnoId, materia]);
+    } else {
+      await db.promise().query(
+        'INSERT INTO notas_finales (usuario_id, materia, nota, docente_id) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE nota = VALUES(nota), docente_id = VALUES(docente_id)',
+        [alumnoId, materia, nota, uid]
+      );
+      await db.promise().query(
+        "INSERT INTO novedades (titulo, texto, tipo, materia, autor_id, destinatario_id, fecha) VALUES ('Nota final cargada', ?, 'aviso', ?, ?, ?, NOW())",
+        [`Ya podés ver tu nota final de ${materia} en Mis materias.`, materia, uid, alumnoId]
+      );
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.log('Error al guardar nota final:', e);
+    res.status(500).json({ error: 'No se pudo guardar la nota final.' });
+  }
+});
 // POST /docentes/:id/avisos  { claves: ["Materia|comisión"], titulo, texto }
 app.post('/docentes/:id/avisos', async (req, res) => {
   const uid = uidValido(req.params.id);
