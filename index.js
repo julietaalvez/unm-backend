@@ -1039,6 +1039,11 @@ app.put('/docentes/:id/finales', async (req, res) => {
         [`Ya podés ver tu nota final de ${materia} en Mis materias.`, materia, uid, alumnoId]
       );
     }
+        const [dest] = await db.promise().query(
+      'SELECT t.token FROM push_tokens t JOIN usuarios u ON u.id = t.usuario_id WHERE t.usuario_id = ? AND (u.notif_push IS NULL OR u.notif_push <> 0)',
+      [alumnoId]
+    );
+    enviarPush(dest.map((d) => d.token), 'Nota final cargada', `Ya podés ver tu nota final de ${materia} en Mis materias.`);
     res.json({ ok: true });
   } catch (e) {
     console.log('Error al guardar nota final:', e);
@@ -1080,10 +1085,51 @@ app.post('/docentes/:id/avisos', async (req, res) => {
       'INSERT INTO novedades (titulo, texto, tipo, materia, comision, autor_id, fecha) VALUES ?',
       [filas]
     );
+        const [dest] = await db.promise().query(
+      `SELECT DISTINCT t.token FROM push_tokens t
+         JOIN inscripciones i ON i.usuario_id = t.usuario_id
+         JOIN usuarios u ON u.id = t.usuario_id
+        WHERE i.clave IN (?) AND (u.notif_push IS NULL OR u.notif_push <> 0)`,
+      [claves]
+    );
+    enviarPush(dest.map((d) => d.token), titulo, texto);
     res.json({ ok: true, enviados: filas.length });
   } catch (e) {
     console.log('Error al enviar aviso:', e);
     res.status(500).json({ error: 'No se pudo enviar el aviso.' });
+  }
+});
+// Envía una notificación push a una lista de tokens (servicio gratuito de Expo)
+async function enviarPush(tokens, title, body) {
+  if (!tokens.length) return;
+  const mensajes = tokens.map((to) => ({ to, title, body, sound: 'default', channelId: 'default', priority: 'high' }));
+  try {
+    for (let i = 0; i < mensajes.length; i += 100) {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(mensajes.slice(i, i + 100)),
+      });
+    }
+  } catch (e) {
+    console.log('Error al enviar push:', e);
+  }
+}
+
+// PUT /usuarios/:id/push-token  { token }
+app.put('/usuarios/:id/push-token', async (req, res) => {
+  const uid = uidValido(req.params.id);
+  const token = String(req.body.token ?? '');
+  if (!uid || !/^ExponentPushToken\[.+\]$/.test(token)) return res.status(400).json({ error: 'Token inválido.' });
+  try {
+    await db.promise().query(
+      'INSERT INTO push_tokens (token, usuario_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE usuario_id = VALUES(usuario_id)',
+      [token, uid]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.log('Error al guardar token push:', e);
+    res.status(500).json({ error: 'No se pudo guardar.' });
   }
 });
 
