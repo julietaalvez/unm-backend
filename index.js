@@ -1052,6 +1052,7 @@ app.post('/docentes/:id/avisos', async (req, res) => {
 
   const titulo = String(req.body.titulo ?? '').trim();
   const texto = String(req.body.texto ?? '').trim();
+    const tipo = req.body.tipo === 'aula' ? 'aula' : 'aviso';
   const claves = [...new Set((Array.isArray(req.body.claves) ? req.body.claves : []).filter((c) => typeof c === 'string' && c.includes('|')))];
 
   if (!titulo || titulo.length > 60 || !texto || texto.length > 300) {
@@ -1073,7 +1074,7 @@ app.post('/docentes/:id/avisos', async (req, res) => {
     const ahora = new Date();
     const filas = claves.map((c) => {
       const i = c.indexOf('|');
-      return [titulo, texto, 'aviso', c.slice(0, i), c.slice(i + 1), uid, ahora];
+            return [titulo, texto, tipo, c.slice(0, i), c.slice(i + 1), uid, ahora];
     });
     await db.promise().query(
       'INSERT INTO novedades (titulo, texto, tipo, materia, comision, autor_id, fecha) VALUES ?',
