@@ -1027,23 +1027,22 @@ app.put('/docentes/:id/finales', async (req, res) => {
     const [ins] = await db.promise().query('SELECT 1 FROM inscripciones WHERE usuario_id = ? AND clave IN (?) LIMIT 1', [alumnoId, mias]);
     if (!ins.length) return res.status(403).json({ error: 'Ese alumno no está anotado en tus comisiones.' });
 
-    if (nota === null) {
+       if (nota === null) {
       await db.promise().query('DELETE FROM notas_finales WHERE usuario_id = ? AND materia = ?', [alumnoId, materia]);
     } else {
+      const [prev] = await db.promise().query('SELECT nota FROM notas_finales WHERE usuario_id = ? AND materia = ?', [alumnoId, materia]);
+      const igual = prev.length > 0 && Number(prev[0].nota) === nota;
       await db.promise().query(
         'INSERT INTO notas_finales (usuario_id, materia, nota, docente_id) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE nota = VALUES(nota), docente_id = VALUES(docente_id)',
         [alumnoId, materia, nota, uid]
       );
-      await db.promise().query(
-        "INSERT INTO novedades (titulo, texto, tipo, materia, autor_id, destinatario_id, fecha) VALUES ('Nota final cargada', ?, 'aviso', ?, ?, ?, NOW())",
-        [`Ya podés ver tu nota final de ${materia} en Mis materias.`, materia, uid, alumnoId]
-      );
+      if (!igual) {
+        await db.promise().query(
+          "INSERT INTO novedades (titulo, texto, tipo, materia, autor_id, destinatario_id, fecha) VALUES ('Nota final cargada', ?, 'aviso', ?, ?, ?, NOW())",
+          [`Ya podés ver tu nota final de ${materia} en Mis materias.`, materia, uid, alumnoId]
+        );
+      }
     }
-        const [dest] = await db.promise().query(
-      'SELECT t.token FROM push_tokens t JOIN usuarios u ON u.id = t.usuario_id WHERE t.usuario_id = ? AND (u.notif_push IS NULL OR u.notif_push <> 0)',
-      [alumnoId]
-    );
-    enviarPush(dest.map((d) => d.token), 'Nota final cargada', `Ya podés ver tu nota final de ${materia} en Mis materias.`);
     res.json({ ok: true });
   } catch (e) {
     console.log('Error al guardar nota final:', e);
@@ -1085,14 +1084,7 @@ app.post('/docentes/:id/avisos', async (req, res) => {
       'INSERT INTO novedades (titulo, texto, tipo, materia, comision, autor_id, fecha) VALUES ?',
       [filas]
     );
-        const [dest] = await db.promise().query(
-      `SELECT DISTINCT t.token FROM push_tokens t
-         JOIN inscripciones i ON i.usuario_id = t.usuario_id
-         JOIN usuarios u ON u.id = t.usuario_id
-        WHERE i.clave IN (?) AND (u.notif_push IS NULL OR u.notif_push <> 0)`,
-      [claves]
-    );
-    enviarPush(dest.map((d) => d.token), titulo, texto);
+        
     res.json({ ok: true, enviados: filas.length });
   } catch (e) {
     console.log('Error al enviar aviso:', e);
@@ -1322,6 +1314,59 @@ app.get('/alumnos/:id/notas', (req, res) => {
     (err, rows) => (err ? errSrv(res, err) : res.json({ notas: rows }))
   );
 });
+/* ---------- Notificaciones push automáticas ---------- */
+let primeraRevision = true;
+async function revisarNovedades() {
+  try {
+    // avisos de las notas de parcial ya publicadas (o programadas cuya hora llegó), para todos los alumnos
+    await db.promise().query(
+      `INSERT IGNORE INTO novedades (titulo, texto, tipo, destinatario_id, ref, fecha)
+       SELECT 'Nueva nota publicada',
+              CONCAT('Ya podés ver tu nota de ', e.nombre, ' en Mis notas.'),
+              'aviso', n.alumno_id, CONCAT('nota:', n.evaluacion_id), NOW()
+       FROM notas n
+       JOIN evaluaciones e ON e.id = n.evaluacion_id
+       WHERE (e.estado = 'publicada' OR (e.estado = 'programada' AND e.publicar_en <= UTC_TIMESTAMP()))`
+    );
+    // en el primer arranque lo que ya existía no se manda de nuevo
+    if (primeraRevision) {
+      primeraRevision = false;
+      await db.promise().query('UPDATE novedades SET push_enviada = 1 WHERE push_enviada = 0');
+      return;
+    }
+    const [nuevas] = await db.promise().query(
+      'SELECT id, titulo, texto, materia, comision, destinatario_id, autor_id FROM novedades WHERE push_enviada = 0 ORDER BY id LIMIT 200'
+    );
+    if (!nuevas.length) return;
+    await db.promise().query('UPDATE novedades SET push_enviada = 1 WHERE id IN (?)', [nuevas.map((n) => n.id)]);
+
+    for (const n of nuevas) {
+      const base =
+        'SELECT DISTINCT t.token FROM push_tokens t JOIN usuarios u ON u.id = t.usuario_id ' +
+        '{JOIN} WHERE (u.notif_push IS NULL OR u.notif_push <> 0) AND t.usuario_id <> ? {AND}';
+      const autor = n.autor_id ?? 0;
+      let sql, params;
+      if (n.destinatario_id) {
+        sql = base.replace('{JOIN}', '').replace('{AND}', 'AND t.usuario_id = ?');
+        params = [autor, n.destinatario_id];
+      } else if (n.materia && n.comision) {
+        sql = base.replace('{JOIN}', 'JOIN inscripciones i ON i.usuario_id = t.usuario_id').replace('{AND}', 'AND i.clave = ?');
+        params = [autor, `${n.materia}|${n.comision}`];
+      } else if (n.materia) {
+        sql = base.replace('{JOIN}', 'JOIN inscripciones i ON i.usuario_id = t.usuario_id').replace('{AND}', 'AND i.clave LIKE ?');
+        params = [autor, `${String(n.materia).replace(/[%_]/g, '\\$&')}|%`];
+      } else {
+        sql = base.replace('{JOIN}', '').replace('{AND}', '');
+        params = [autor];
+      }
+      const [dest] = await db.promise().query(sql, params);
+      await enviarPush(dest.map((d) => d.token), n.titulo, n.texto);
+    }
+  } catch (e) {
+    console.log('Error al revisar novedades:', e);
+  }
+}
+setInterval(revisarNovedades, 30000);
 
 app.listen(process.env.PORT || 3000, () =>
   console.log('Servidor corriendo en el puerto', process.env.PORT || 3000)
