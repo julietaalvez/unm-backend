@@ -38,7 +38,7 @@ app.get('/espacios', (req, res) => {
 });
 
 app.get('/novedades', (req, res) => {
-  db.query('SELECT * FROM novedades ORDER BY fecha DESC', (err, results) => {
+    db.query('SELECT * FROM novedades ORDER BY fecha DESC LIMIT 100', (err, results) => {
     if (err) {
       console.log('Error en /novedades:', err);
       return res.status(500).json({ error: 'Error del servidor.' });
